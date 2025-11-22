@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, State, WebSocketUpgrade, ws::{Message, WebSocket}},
     routing::{get, post},
     Json, Router, http::StatusCode, response::{IntoResponse, Response},
 };
@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tokio::task::JoinHandle;
+use futures_util::{StreamExt, SinkExt};
 
 use crate::blockchain::{Blockchain, Block};
 use crate::persistence::Database;
 use crate::transaction::Transaction;
 use crate::crypto::KeyPair;
 use crate::miner;
-use crate::network::Node;
+use crate::network::{Node, NetworkMessage};
 use secp256k1::ecdsa::Signature;
 
 /// Mining state that tracks the current mining operation
@@ -132,13 +133,17 @@ pub async fn run_api_server() {
         // Network
         .route("/network/peers", get(get_peers))
         .route("/network/info", get(get_network_info))
+        // WebSocket P2P Bridge
+        .route("/ws/p2p", get(ws_p2p_handler))
         .with_state(app_state)
         .layer(cors.clone());
 
-    // Serve static files from dashboard directory
-    let serve_dir = ServeDir::new("dashboard");
+    // Serve static files from dashboard/dist directory (Vite build output)
+    let serve_dir = ServeDir::new("dashboard/dist");
 
     let app = Router::new()
+        .route("/", get(serve_landing))
+        .route("/dashboard", get(serve_dashboard))
         .nest("/api", api_routes)
         .fallback_service(serve_dir)
         .layer(cors);
@@ -161,6 +166,22 @@ pub async fn run_api_server() {
     println!("API server listening on http://{}", addr);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("API server encountered a fatal error: {}", e);
+    }
+}
+
+// Landing page handler
+async fn serve_landing() -> impl IntoResponse {
+    match tokio::fs::read_to_string("dashboard/dist/landing.html").await {
+        Ok(html) => axum::response::Html(html).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Landing page not found").into_response(),
+    }
+}
+
+// Dashboard app handler
+async fn serve_dashboard() -> impl IntoResponse {
+    match tokio::fs::read_to_string("dashboard/dist/index.html").await {
+        Ok(html) => axum::response::Html(html).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Dashboard not found").into_response(),
     }
 }
 
@@ -203,12 +224,23 @@ pub struct RecentBlock {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatsResponse {
-    pub height: u64,
+    pub chain_height: u64,
     pub difficulty: u64,
     pub utxo_count: usize,
     pub mempool_size: usize,
+    pub blocks_to_halving: u64,
     pub recent_blocks: Vec<RecentBlock>,
+    // Additional fields for dashboard
+    pub blocks_mined: u64,
+    pub total_earned: u64,
+    pub current_reward: u64,
+    pub avg_block_time: f64,
+    pub uptime: u64,
+    pub total_supply: u64,
+    pub max_supply: u64,
+    pub halving_era: u64,
 }
 
 async fn get_blockchain_stats(State(state): State<AppState>) -> impl IntoResponse {
@@ -216,17 +248,79 @@ async fn get_blockchain_stats(State(state): State<AppState>) -> impl IntoRespons
         Ok(lock) => lock,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get blockchain lock").into_response(),
     };
-    let recent_blocks = blockchain.blocks.iter().rev().take(6).map(|b| RecentBlock {
+    let recent_blocks: Vec<RecentBlock> = blockchain.blocks.iter().rev().take(6).map(|b| RecentBlock {
         height: b.header.height,
         hash: hex::encode(b.hash),
     }).collect();
 
+    let height = blockchain.blocks.len() as u64;
+    const HALVING_INTERVAL: u64 = 210_000;
+    let blocks_to_halving = HALVING_INTERVAL - (height % HALVING_INTERVAL);
+
+    // Calculate halving era (0 = first era with full reward)
+    let halving_era = height / HALVING_INTERVAL;
+
+    // Current block reward
+    let current_reward = Blockchain::calculate_block_reward(height);
+
+    // Max supply (geometric series: 50*210000 * (1 + 0.5 + 0.25 + ...) ≈ 21M equivalent)
+    // For TrinityChain with 1000 initial reward: 1000 * 210000 * 2 = 420M
+    const MAX_SUPPLY: u64 = 420_000_000;
+
+    // Calculate total supply minted so far
+    let total_supply: u64 = (0..=halving_era).map(|era| {
+        let era_reward = 1000u64 >> era; // 1000, 500, 250, etc.
+        let blocks_in_era = if era < halving_era {
+            HALVING_INTERVAL
+        } else {
+            height % HALVING_INTERVAL
+        };
+        era_reward.saturating_mul(blocks_in_era)
+    }).sum();
+
+    // Calculate average block time from recent blocks
+    let avg_block_time = if blockchain.blocks.len() > 1 {
+        let recent: Vec<_> = blockchain.blocks.iter().rev().take(10).collect();
+        if recent.len() > 1 {
+            let time_diffs: Vec<f64> = recent.windows(2)
+                .map(|w| (w[0].header.timestamp - w[1].header.timestamp).abs() as f64)
+                .collect();
+            if !time_diffs.is_empty() {
+                time_diffs.iter().sum::<f64>() / time_diffs.len() as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    // Total earned (sum of all coinbase rewards in chain)
+    let total_earned: u64 = blockchain.blocks.iter()
+        .filter_map(|b| b.transactions.first())
+        .filter_map(|tx| match tx {
+            crate::transaction::Transaction::Coinbase(cb) => Some(cb.reward_area),
+            _ => None,
+        })
+        .sum();
+
     Json(StatsResponse {
-        height: blockchain.blocks.len() as u64,
+        chain_height: height,
         difficulty: blockchain.difficulty,
         utxo_count: blockchain.state.utxo_set.len(),
         mempool_size: blockchain.mempool.len(),
+        blocks_to_halving,
         recent_blocks,
+        blocks_mined: height,
+        total_earned,
+        current_reward,
+        avg_block_time,
+        uptime: 0, // Would need server start time tracking
+        total_supply,
+        max_supply: MAX_SUPPLY,
+        halving_era,
     }).into_response()
 }
 
@@ -297,11 +391,30 @@ async fn get_recent_blocks(State(state): State<AppState>) -> impl IntoResponse {
         Ok(lock) => lock,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get blockchain lock").into_response(),
     };
-    let blocks: Vec<RecentBlock> = blockchain.blocks.iter().rev().take(20).map(|b| RecentBlock {
-        height: b.header.height,
-        hash: hex::encode(b.hash),
+    let blocks: Vec<serde_json::Value> = blockchain.blocks.iter().rev().take(50).map(|b| {
+        // Extract reward from coinbase transaction
+        let reward = b.transactions.first()
+            .and_then(|tx| match tx {
+                crate::transaction::Transaction::Coinbase(cb) => Some(cb.reward_area),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        serde_json::json!({
+            "index": b.header.height,
+            "height": b.header.height,
+            "hash": hex::encode(b.hash),
+            "previousHash": hex::encode(b.header.previous_hash),
+            "timestamp": b.header.timestamp,
+            "difficulty": b.header.difficulty,
+            "nonce": b.header.nonce,
+            "merkleRoot": hex::encode(b.header.merkle_root),
+            "transactions": b.transactions.len(),
+            "reward": reward,
+        })
     }).collect();
-    Json(blocks).into_response()
+    // Wrap in object for dashboard compatibility
+    Json(serde_json::json!({ "blocks": blocks })).into_response()
 }
 
 async fn get_block_by_height(State(state): State<AppState>, Path(height): Path<u64>) -> Result<Json<Option<Block>>, Response> {
@@ -393,7 +506,8 @@ async fn get_pending_transactions(State(state): State<AppState>) -> impl IntoRes
 pub struct WalletResponse {
     pub address: String,
     pub public_key: String,
-    pub private_key: String,
+    // SECURITY: Private key removed from API response to prevent exposure
+    // Private keys should only be shown once in terminal or downloaded as encrypted wallet file
 }
 
 
@@ -409,12 +523,12 @@ async fn create_wallet() -> Result<Json<WalletResponse>, Response> {
         Ok(keypair) => {
             let address = keypair.address();
             let public_key = hex::encode(keypair.public_key.serialize());
-            let private_key = hex::encode(keypair.secret_key.secret_bytes());
+            // SECURITY: Private key NOT included in response for security
+            // Users should use CLI wallet tools to generate and securely store keys
 
             Ok(Json(WalletResponse {
                 address,
                 public_key,
-                private_key,
             }))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate keypair: {}", e)).into_response()),
@@ -436,11 +550,11 @@ async fn import_wallet(Json(req): Json<ImportWalletRequest>) -> Result<Json<Wall
         Ok(keypair) => {
             let address = keypair.address();
             let public_key = hex::encode(keypair.public_key.serialize());
+            // SECURITY: Private key NOT echoed back in response
 
             Ok(Json(WalletResponse {
                 address,
                 public_key,
-                private_key: req.private_key,
             }))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, format!("Invalid private key: {}", e)).into_response()),
@@ -517,8 +631,14 @@ async fn get_mining_status(State(state): State<AppState>) -> impl IntoResponse {
                     Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get blockchain lock").into_response(),
                 };
                 let difficulty = blockchain.difficulty;
-                let expected_hashes = 16_u64.pow(difficulty as u32) as f64;
-                expected_hashes / elapsed
+                // Calculate expected hashes safely to prevent overflow
+                // For each leading zero, we expect 16x more hashes on average
+                // Cap at difficulty 40 to prevent f64 overflow (16^40 < f64::MAX)
+                let safe_difficulty = difficulty.min(40);
+                let expected_hashes = 16_f64.powi(safe_difficulty as i32);
+
+                // Return hashrate in hashes/second
+                expected_hashes / elapsed.max(0.001) // Prevent division by very small numbers
             } else {
                 0.0
             }
@@ -556,11 +676,7 @@ async fn start_mining(State(state): State<AppState>, Json(req): Json<StartMining
                 break;
             }
 
-            
-            tokio::time::sleep(Duration::from_secs(1)).await; // Add a 1-second delay to prevent timestamp issues
-
-            // Ensure Duration is imported if not already
-            use std::time::Duration; // Add this if not already present, though it likely is.// Get pending transactions
+            // Get pending transactions
             let block = {
                 let blockchain = match blockchain_clone.lock() {
                     Ok(lock) => lock,
@@ -572,8 +688,19 @@ async fn start_mining(State(state): State<AppState>, Json(req): Json<StartMining
                 };
                 let transactions = blockchain.mempool.get_all_transactions();
 
+                let height = blockchain.blocks.len() as u64;
+                let last_block = blockchain.blocks.last().expect("Blockchain should have at least a genesis block");
+                let previous_hash = last_block.hash;
+                let parent_timestamp = last_block.header.timestamp;
+                let difficulty = blockchain.difficulty;
+
+                // Calculate proper block reward with halving
+                // Block reward is static u64, fees are geometric f64
+                let block_reward = Blockchain::calculate_block_reward(height);
+                let total_fees = Blockchain::calculate_total_fees(&transactions);
+                let reward_area = block_reward.saturating_add(total_fees as u64);
+
                 // Create coinbase transaction
-                let reward_area = 100u64;
                 let coinbase = Transaction::Coinbase(crate::transaction::CoinbaseTx {
                     reward_area,
                     beneficiary_address: miner_address.clone(),
@@ -582,16 +709,26 @@ async fn start_mining(State(state): State<AppState>, Json(req): Json<StartMining
                 let mut all_txs = vec![coinbase];
                 all_txs.extend(transactions);
 
-                let height = blockchain.blocks.len() as u64;
-                let previous_hash = blockchain.blocks.last().expect("Blockchain should have at least a genesis block").hash;
-                let difficulty = blockchain.difficulty;
-
-                Block::new(height, previous_hash, difficulty, all_txs)
+                Block::new_with_parent_time(height, previous_hash, parent_timestamp, difficulty, all_txs)
             };
 
-            // Mine the block (this is CPU intensive)
+            // Mine the block (this is CPU intensive - run on blocking thread pool)
             let start = Instant::now();
-            match miner::mine_block(block) {
+            let mine_result = tokio::task::spawn_blocking(move || {
+                miner::mine_block(block)
+            }).await;
+
+            // Handle spawn_blocking result
+            let mine_result = match mine_result {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Mining task panicked: {}", e);
+                    mining_state.is_mining.store(false, Ordering::Relaxed);
+                    break;
+                }
+            };
+
+            match mine_result {
                 Ok(mined_block) => {
                     // Update last block time
                     {
@@ -806,6 +943,99 @@ async fn get_block_reward_info(State(state): State<AppState>, Path(height): Path
         blocks_until_halving,
         reward_after_halving,
     }).into_response()
+}
+
+/// WebSocket P2P Bridge Handler
+/// Allows nodes to communicate over WebSocket instead of raw TCP
+async fn ws_p2p_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_p2p(socket, state))
+}
+
+async fn handle_ws_p2p(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    println!("🌐 WebSocket P2P connection established");
+
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Binary(data)) => {
+                // Deserialize the NetworkMessage from bincode
+                match bincode::deserialize::<NetworkMessage>(&data) {
+                    Ok(message) => {
+                        let response = handle_network_message(message, &state).await;
+                        if let Some(resp_data) = response {
+                            if let Err(e) = sender.send(Message::Binary(resp_data)).await {
+                                eprintln!("❌ WebSocket send error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                println!("🔌 WebSocket P2P connection closed");
+                break;
+            }
+            Ok(_) => {} // Ignore other message types
+            Err(e) => {
+                eprintln!("❌ WebSocket error: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_network_message(message: NetworkMessage, state: &AppState) -> Option<Vec<u8>> {
+    match message {
+        NetworkMessage::GetBlockHeaders { after_height } => {
+            let blockchain = state.blockchain.lock().ok()?;
+            let headers: Vec<_> = blockchain.blocks
+                .iter()
+                .filter(|b| b.header.height > after_height)
+                .map(|b| b.header.clone())
+                .collect();
+            let response = NetworkMessage::BlockHeaders(headers);
+            bincode::serialize(&response).ok()
+        }
+        NetworkMessage::GetBlocks(hashes) => {
+            let blockchain = state.blockchain.lock().ok()?;
+            let blocks: Vec<_> = hashes.iter()
+                .filter_map(|h| blockchain.block_index.get(h).cloned())
+                .collect();
+            let response = NetworkMessage::Blocks(blocks);
+            bincode::serialize(&response).ok()
+        }
+        NetworkMessage::GetPeers => {
+            let peers = state.network.peers.lock().ok()?;
+            let response = NetworkMessage::Peers(peers.clone());
+            bincode::serialize(&response).ok()
+        }
+        NetworkMessage::NewBlock(block) => {
+            let mut blockchain = state.blockchain.lock().ok()?;
+            if let Err(e) = blockchain.apply_block(*block) {
+                eprintln!("❌ Failed to add block: {}", e);
+            }
+            None
+        }
+        NetworkMessage::NewTransaction(tx) => {
+            let mut blockchain = state.blockchain.lock().ok()?;
+            if let Err(e) = blockchain.mempool.add_transaction(*tx) {
+                eprintln!("❌ Failed to add transaction: {}", e);
+            }
+            None
+        }
+        NetworkMessage::Ping => {
+            let response = NetworkMessage::Pong;
+            bincode::serialize(&response).ok()
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

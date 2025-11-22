@@ -25,13 +25,51 @@ pub fn genesis_triangle() -> Triangle {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriangleState {
     pub utxo_set: HashMap<Sha256Hash, Triangle>,
+    /// Address index: maps owner address to list of triangle hashes they own
+    /// This makes balance queries O(1) instead of O(n)
+    #[serde(skip)]
+    pub address_index: HashMap<String, Vec<Sha256Hash>>,
 }
 
 impl TriangleState {
     pub fn new() -> Self {
         TriangleState {
             utxo_set: HashMap::new(),
+            address_index: HashMap::new(),
         }
+    }
+
+    /// Rebuild the address index from the UTXO set
+    /// Should be called after loading from database
+    pub fn rebuild_address_index(&mut self) {
+        self.address_index.clear();
+        for (hash, triangle) in &self.utxo_set {
+            self.address_index
+                .entry(triangle.owner.clone())
+                .or_insert_with(Vec::new)
+                .push(*hash);
+        }
+    }
+
+    /// Get all triangles owned by an address (O(1) lookup)
+    pub fn get_triangles_by_owner(&self, owner: &str) -> Vec<&Triangle> {
+        self.address_index
+            .get(owner)
+            .map(|hashes| {
+                hashes
+                    .iter()
+                    .filter_map(|hash| self.utxo_set.get(hash))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Calculate total area owned by an address (O(1) lookup + O(k) sum where k = # triangles owned)
+    pub fn get_balance(&self, owner: &str) -> f64 {
+        self.get_triangles_by_owner(owner)
+            .iter()
+            .map(|t| t.area())
+            .sum()
     }
 
     pub fn count(&self) -> usize {
@@ -41,19 +79,32 @@ impl TriangleState {
     /// Apply a subdivision transaction to the state
     /// Optimized to minimize hash calculations and clones
     pub fn apply_subdivision(&mut self, tx: &SubdivisionTx) -> Result<(), ChainError> {
-        // Use entry API to avoid double lookup
-        if self.utxo_set.remove(&tx.parent_hash).is_none() {
-            return Err(ChainError::TriangleNotFound(format!(
+        // Remove parent from UTXO set and address index
+        let parent = self.utxo_set.remove(&tx.parent_hash).ok_or_else(|| {
+            ChainError::TriangleNotFound(format!(
                 "Parent triangle {} not found",
                 hex::encode(tx.parent_hash)
-            )));
+            ))
+        })?;
+
+        // Update address index: remove parent hash
+        if let Some(hashes) = self.address_index.get_mut(&parent.owner) {
+            hashes.retain(|h| h != &tx.parent_hash);
+            if hashes.is_empty() {
+                self.address_index.remove(&parent.owner);
+            }
         }
 
-        // Reserve capacity for children before the loop to avoid reallocations
-        // Subdivisions always produce exactly 3 children
+        // Add children to UTXO set and address index
         for child in &tx.children {
             let child_hash = child.hash();
             self.utxo_set.insert(child_hash, child.clone());
+
+            // Update address index: add child hash
+            self.address_index
+                .entry(child.owner.clone())
+                .or_insert_with(Vec::new)
+                .push(child_hash);
         }
 
         Ok(())
@@ -86,7 +137,13 @@ impl TriangleState {
         );
 
         let hash = new_triangle.hash();
-        self.utxo_set.insert(hash, new_triangle);
+        self.utxo_set.insert(hash, new_triangle.clone());
+
+        // Update address index
+        self.address_index
+            .entry(tx.beneficiary_address.clone())
+            .or_insert_with(Vec::new)
+            .push(hash);
 
         Ok(())
     }
@@ -155,16 +212,44 @@ impl Block {
         }
     }
 
+    /// Create a new block ensuring timestamp is greater than parent timestamp
+    pub fn new_with_parent_time(
+        height: BlockHeight,
+        previous_hash: Sha256Hash,
+        parent_timestamp: i64,
+        difficulty: u64,
+        transactions: Vec<Transaction>,
+    ) -> Self {
+        let mut timestamp = Utc::now().timestamp();
+
+        // Ensure timestamp is strictly greater than parent
+        if timestamp <= parent_timestamp {
+            timestamp = parent_timestamp + 1;
+        }
+
+        let merkle_root = Self::calculate_merkle_root(&transactions);
+
+        let header = BlockHeader {
+            height,
+            previous_hash,
+            timestamp,
+            difficulty,
+            nonce: 0,
+            merkle_root,
+            headline: None,
+        };
+
+        Block {
+            header,
+            hash: [0; 32],
+            transactions,
+        }
+    }
+
     #[inline]
     pub fn calculate_hash(&self) -> Sha256Hash {
-        let mut hasher = Sha256::new();
-        hasher.update(self.header.height.to_le_bytes());
-        hasher.update(self.header.previous_hash);
-        hasher.update(self.header.timestamp.to_le_bytes());
-        hasher.update(self.header.difficulty.to_le_bytes());
-        hasher.update(self.header.nonce.to_le_bytes());
-        hasher.update(self.header.merkle_root);
-        hasher.finalize().into()
+        // Delegate to header's hash calculation for consistency
+        self.header.calculate_hash()
     }
 
     pub fn calculate_merkle_root(transactions: &[Transaction]) -> Sha256Hash {
@@ -293,30 +378,36 @@ impl Mempool {
     }
 
     /// Evict the transaction with the lowest fee to make room for new ones
+    /// Optimized: When mempool is very full, evict 10% of lowest-fee transactions at once
+    /// to reduce the frequency of this expensive O(n) operation
     fn evict_lowest_fee_transaction(&mut self) -> Result<(), ChainError> {
         if self.transactions.is_empty() {
             return Ok(());
         }
 
-        // Find transaction with lowest fee
-        let mut lowest_fee = u64::MAX;
-        let mut lowest_hash: Option<Sha256Hash> = None;
+        // If mempool is > 90% full, do batch eviction (10% of transactions)
+        let evict_count = if self.transactions.len() > Self::MAX_TRANSACTIONS * 9 / 10 {
+            (Self::MAX_TRANSACTIONS / 10).max(1) // Evict 10% at once
+        } else {
+            1 // Just evict one
+        };
 
-        for (hash, tx) in &self.transactions {
-            let fee = match tx {
-                Transaction::Transfer(t) => t.fee,
-                Transaction::Subdivision(_) => 0, // Subdivisions don't have fees
-                Transaction::Coinbase(_) => 0,
-            };
+        // Collect (fee_area, hash) pairs and sort
+        // Use f64 for geometric fees
+        let mut tx_fees: Vec<(f64, Sha256Hash)> = self.transactions
+            .iter()
+            .map(|(hash, tx)| {
+                let fee = tx.fee_area();
+                (fee, *hash)
+            })
+            .collect();
 
-            if fee < lowest_fee {
-                lowest_fee = fee;
-                lowest_hash = Some(*hash);
-            }
-        }
+        // Sort by fee (ascending) - lowest fees first for eviction
+        tx_fees.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        if let Some(hash) = lowest_hash {
-            self.transactions.remove(&hash);
+        // Remove the lowest-fee transactions
+        for (_, hash) in tx_fees.iter().take(evict_count) {
+            self.transactions.remove(hash);
         }
 
         Ok(())
@@ -345,14 +436,16 @@ impl Mempool {
         }
 
         // Use partial sort for better performance when limit is small
-        // This is O(n log k) instead of O(n log n) where k = limit
-        txs.select_nth_unstable_by(limit, |a, b| b.fee().cmp(&a.fee()));
+        // This is O(n + k log k) instead of O(n log n) where k = limit
+        // select_nth_unstable_by partitions so that elements [0..limit] have the highest fees
+        txs.select_nth_unstable_by(limit - 1, |a, b| b.fee().cmp(&a.fee()));
 
-        // Sort the top `limit` transactions
-        let (top, _, _) = txs.select_nth_unstable_by(limit - 1, |a, b| b.fee().cmp(&a.fee()));
-        top.sort_unstable_by(|a, b| b.fee().cmp(&a.fee()));
+        // Now sort only the top limit transactions
+        txs[..limit].sort_unstable_by(|a, b| b.fee().cmp(&a.fee()));
 
-        txs.into_iter().take(limit).collect()
+        // Return only the top limit transactions
+        txs.truncate(limit);
+        txs
     }
 
     /// Get a specific transaction by hash
@@ -457,6 +550,15 @@ const MAX_HALVINGS: u64 = 64;
 /// = 1000 * 210,000 * 2 = 420,000,000 area units
 pub const MAX_SUPPLY: u64 = INITIAL_MINING_REWARD * REWARD_HALVING_INTERVAL * 2;
 
+/// Calculate block reward based on height (with halving)
+pub fn calculate_block_reward(height: BlockHeight) -> u64 {
+    let halvings = height / REWARD_HALVING_INTERVAL;
+    if halvings >= MAX_HALVINGS {
+        return 0;
+    }
+    INITIAL_MINING_REWARD >> halvings
+}
+
 impl Blockchain {
     pub fn new() -> Self {
         let mut state = TriangleState::new();
@@ -464,15 +566,19 @@ impl Blockchain {
         let genesis_hash = genesis.hash();
         state.utxo_set.insert(genesis_hash, genesis);
 
+        // Use a fixed genesis timestamp (January 1, 2024, 00:00:00 UTC)
+        // This ensures the genesis block is always the same across all instances
+        let genesis_timestamp: i64 = 1704067200;
+
         let mut genesis_block = Block {
             header: BlockHeader {
                 height: 0,
                 previous_hash: [0; 32],
-                timestamp: Utc::now().timestamp() - 1, // Genesis block is in the past
+                timestamp: genesis_timestamp,
                 difficulty: 2,
                 nonce: 0,
                 merkle_root: [0; 32],
-                headline: Some("Al's forward march confronts investor jitters over staggering valuations and a bull case that won't quit.".to_string()),
+                headline: Some("TrinityChain Genesis Block - Sierpinski Triangle Blockchain".to_string()),
             },
             hash: [0; 32], // Will be calculated based on header content
             transactions: vec![],
@@ -602,12 +708,13 @@ impl Blockchain {
             let block_reward = Self::calculate_block_reward(block.header.height);
             let total_fees = Self::calculate_total_fees(&block.transactions);
 
-            // Use saturating_add to prevent integer overflow
-            let max_reward = block_reward.saturating_add(total_fees);
+            // Max reward = static block reward + geometric fee area (converted to u64)
+            // Note: fee_area is f64, so we floor it for coinbase calculation
+            let max_reward = block_reward.saturating_add(total_fees as u64);
 
             if coinbase_reward > max_reward {
                 return Err(ChainError::InvalidTransaction(
-                    format!("Coinbase reward {} exceeds maximum allowed {} (block reward: {}, fees: {})",
+                    format!("Coinbase reward {} exceeds maximum allowed {} (block reward: {}, fees: {:.9})",
                         coinbase_reward, max_reward, block_reward, total_fees)
                 ));
             }
@@ -627,12 +734,8 @@ impl Blockchain {
                     cb_tx.validate()?;
                 },
                 Transaction::Transfer(tx) => {
-                    if !self.state.utxo_set.contains_key(&tx.input_hash) {
-                        return Err(ChainError::InvalidTransaction(
-                            format!("Transfer input {} not in UTXO set", hex::encode(tx.input_hash))
-                        ));
-                    }
-                    tx.validate()?;
+                    // Full validation including UTXO existence and fee_area check
+                    tx.validate_with_state(&self.state)?;
                 },
             }
         }
@@ -662,11 +765,48 @@ impl Blockchain {
                         self.state.apply_coinbase(cb_tx, valid_block.header.height)?;
                     },
                     Transaction::Transfer(tx) => {
-                        let triangle = self.state.utxo_set.get_mut(&tx.input_hash)
+                        // GEOMETRIC FEE DEDUCTION:
+                        // 1. Remove old triangle from UTXO set
+                        // 2. Create new triangle with same geometry, new owner, reduced value
+                        // 3. Fee is implicitly collected in coinbase reward
+
+                        // Get the old triangle and compute new value
+                        let old_triangle = self.state.utxo_set.remove(&tx.input_hash)
                             .ok_or_else(|| ChainError::TriangleNotFound(
                                 format!("Transfer input {} missing from UTXO set", hex::encode(tx.input_hash))
                             ))?;
-                        triangle.owner = tx.new_owner.clone();
+
+                        let old_owner = old_triangle.owner.clone();
+                        let old_value = old_triangle.effective_value();
+                        let new_value = old_value - tx.fee_area;
+
+                        // Remove from old owner's address index
+                        if let Some(hashes) = self.state.address_index.get_mut(&old_owner) {
+                            hashes.retain(|h| h != &tx.input_hash);
+                            if hashes.is_empty() {
+                                self.state.address_index.remove(&old_owner);
+                            }
+                        }
+
+                        // Create new triangle with reduced value and new owner
+                        let new_triangle = crate::geometry::Triangle::new_with_value(
+                            old_triangle.a,
+                            old_triangle.b,
+                            old_triangle.c,
+                            old_triangle.parent_hash,
+                            tx.new_owner.clone(),
+                            new_value,
+                        );
+
+                        // Insert new triangle (same hash since geometry unchanged)
+                        let new_hash = new_triangle.hash();
+                        self.state.utxo_set.insert(new_hash, new_triangle);
+
+                        // Add to new owner's index
+                        self.state.address_index
+                            .entry(tx.new_owner.clone())
+                            .or_insert_with(Vec::new)
+                            .push(new_hash);
                     }
                 }
             }
@@ -769,11 +909,44 @@ impl Blockchain {
                         new_state.apply_coinbase(cb_tx, block.header.height)?;
                     }
                     Transaction::Transfer(transfer_tx) => {
-                        let triangle = new_state.utxo_set.get_mut(&transfer_tx.input_hash)
+                        // GEOMETRIC FEE DEDUCTION during fork rebuild:
+                        // Same logic as apply_block
+
+                        let old_triangle = new_state.utxo_set.remove(&transfer_tx.input_hash)
                             .ok_or_else(|| ChainError::TriangleNotFound(
                                 format!("During fork rebuild, transfer input {} not found", hex::encode(transfer_tx.input_hash))
                             ))?;
-                        triangle.owner = transfer_tx.new_owner.clone();
+
+                        let old_owner = old_triangle.owner.clone();
+                        let old_value = old_triangle.effective_value();
+                        let new_value = old_value - transfer_tx.fee_area;
+
+                        // Remove from old owner's index
+                        if let Some(hashes) = new_state.address_index.get_mut(&old_owner) {
+                            hashes.retain(|h| h != &transfer_tx.input_hash);
+                            if hashes.is_empty() {
+                                new_state.address_index.remove(&old_owner);
+                            }
+                        }
+
+                        // Create new triangle with reduced value and new owner
+                        let new_triangle = crate::geometry::Triangle::new_with_value(
+                            old_triangle.a,
+                            old_triangle.b,
+                            old_triangle.c,
+                            old_triangle.parent_hash,
+                            transfer_tx.new_owner.clone(),
+                            new_value,
+                        );
+
+                        let new_hash = new_triangle.hash();
+                        new_state.utxo_set.insert(new_hash, new_triangle);
+
+                        // Add to new owner's index
+                        new_state.address_index
+                            .entry(transfer_tx.new_owner.clone())
+                            .or_insert_with(Vec::new)
+                            .push(new_hash);
                     }
                 }
             }
@@ -834,12 +1007,19 @@ impl Blockchain {
         next_halving_height.saturating_sub(current_height)
     }
 
-    /// Calculate total transaction fees in a block
-    pub fn calculate_total_fees(transactions: &[Transaction]) -> u64 {
+    /// Calculate total geometric fee area in a block
+    /// Returns the sum of all fee_area values from transfer and subdivision transactions
+    pub fn calculate_total_fees(transactions: &[Transaction]) -> f64 {
         transactions.iter()
             .filter(|tx| !matches!(tx, Transaction::Coinbase(_)))
-            .map(|tx| tx.fee())
-            .fold(0u64, |acc, fee| acc.saturating_add(fee))
+            .map(|tx| tx.fee_area())
+            .fold(0.0_f64, |acc, fee| acc + fee)
+    }
+
+    /// Calculate total fees as u64 (for backward compatibility)
+    /// Deprecated: Use calculate_total_fees() which returns f64
+    pub fn calculate_total_fees_u64(transactions: &[Transaction]) -> u64 {
+        Self::calculate_total_fees(transactions) as u64
     }
 
     fn adjust_difficulty(&mut self) {
@@ -1431,29 +1611,26 @@ mod tests {
         let children = genesis.subdivide();
         let address = "test_address".to_string();
 
-        // Test subdivision transaction with fee
+        // Test subdivision transaction with fee (still u64 for SubdivisionTx)
         let sub_tx = SubdivisionTx::new(genesis.hash(), children.to_vec(), address.clone(), 100, 1);
         let tx1 = Transaction::Subdivision(sub_tx);
-        assert_eq!(tx1.fee(), 100);
+        assert!((tx1.fee_area() - 100.0).abs() < 1e-9);
 
-        // Test transfer transaction with fee
-        let transfer_tx = TransferTx {
-            input_hash: genesis.hash(),
-            new_owner: "new_owner".to_string(),
-            sender: address,
-            fee: 50,
-            nonce: 1,
-            memo: None,
-            signature: None,
-            public_key: None,
-        };
+        // Test transfer transaction with geometric fee_area (f64)
+        let transfer_tx = TransferTx::new(
+            genesis.hash(),
+            "new_owner".to_string(),
+            address,
+            50.5, // Geometric fee area
+            1,
+        );
         let tx2 = Transaction::Transfer(transfer_tx);
-        assert_eq!(tx2.fee(), 50);
+        assert!((tx2.fee_area() - 50.5).abs() < 1e-9);
 
-        // Test total fees calculation
+        // Test total fees calculation (now returns f64)
         let transactions = vec![tx1, tx2];
         let total_fees = Blockchain::calculate_total_fees(&transactions);
-        assert_eq!(total_fees, 150);
+        assert!((total_fees - 150.5).abs() < 1e-9);
     }
 
     #[test]

@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     pb.set_message("Creating transaction...");
 
-    let mut tx = TransferTx::new(full_hash, to_address.to_string(), from_address.clone(), 0, chain.blocks.len() as u64);
+    let mut tx = TransferTx::new(full_hash, to_address.to_string(), from_address.clone(), 0.0, chain.blocks.len() as u64);
 
     if let Some(m) = memo {
         tx = tx.with_memo(m)?;

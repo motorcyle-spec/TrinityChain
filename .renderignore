@@ -1,0 +1,17 @@
+# Ignore unnecessary files during Render deployment
+target/debug/
+*.db
+*.db-shm
+*.db-wal
+.git/
+.github/
+*.log
+.DS_Store
+node_modules/
+dashboard/node_modules/
+dashboard/.vite/
+*.swp
+*.swo
+*~
+.env.local
+.env.*.local

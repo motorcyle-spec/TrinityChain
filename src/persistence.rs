@@ -120,7 +120,10 @@ impl Database {
             utxo_set.insert(hash, triangle);
         }
 
-        Ok(TriangleState { utxo_set })
+        Ok(TriangleState {
+            utxo_set,
+            address_index: HashMap::new(), // Will be rebuilt by caller
+        })
     }
 
     pub fn save_difficulty(&self, difficulty: u64) -> Result<(), ChainError> {
@@ -288,7 +291,11 @@ impl Database {
 
         let block_index = blocks.iter().map(|b| (b.hash, b.clone())).collect();
 
-        let state = self.load_utxo_set()?;
+        let mut state = self.load_utxo_set()?;
+
+        // Rebuild address index from UTXO set
+        state.rebuild_address_index();
+
         let mempool = Mempool::new();
         let blockchain = Blockchain {
             blocks,

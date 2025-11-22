@@ -8,6 +8,9 @@ use crate::blockchain::Blockchain;
 use crate::error::ChainError;
 use crate::sync::NodeSynchronizer;
 
+/// Maximum message size to prevent DoS attacks (10MB)
+const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub host: String,
@@ -97,6 +100,11 @@ impl NetworkNode {
             .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;
         let len = u32::from_be_bytes(len_bytes) as usize;
 
+        // Prevent DoS: reject messages larger than MAX_MESSAGE_SIZE
+        if len > MAX_MESSAGE_SIZE {
+            return Err(ChainError::NetworkError(format!("Message too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE)));
+        }
+
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await
             .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;
@@ -146,6 +154,11 @@ impl NetworkNode {
             stream.read_exact(&mut len_bytes).await
                 .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;
             let len = u32::from_be_bytes(len_bytes) as usize;
+
+            // Prevent DoS: reject messages larger than MAX_MESSAGE_SIZE
+            if len > MAX_MESSAGE_SIZE {
+                return Err(ChainError::NetworkError(format!("Message too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE)));
+            }
 
             let mut buffer = vec![0u8; len];
             stream.read_exact(&mut buffer).await
@@ -197,6 +210,11 @@ impl NetworkNode {
         stream.read_exact(&mut len_bytes).await
             .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;
         let len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Prevent DoS: reject messages larger than MAX_MESSAGE_SIZE
+        if len > MAX_MESSAGE_SIZE {
+            return Err(ChainError::NetworkError(format!("Message too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE)));
+        }
 
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await
@@ -341,8 +359,8 @@ impl NetworkNode {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-enum NetworkMessage {
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum NetworkMessage {
     GetBlockHeaders { after_height: u64 },
     BlockHeaders(Vec<crate::blockchain::BlockHeader>),
     GetBlock(crate::blockchain::Sha256Hash),
@@ -369,7 +387,12 @@ async fn handle_connection(
     socket.read_exact(&mut len_bytes).await
         .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;
     let len = u32::from_be_bytes(len_bytes) as usize;
-    
+
+    // Prevent DoS: reject messages larger than MAX_MESSAGE_SIZE
+    if len > MAX_MESSAGE_SIZE {
+        return Err(ChainError::NetworkError(format!("Message too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE)));
+    }
+
     let mut buffer = vec![0u8; len];
     socket.read_exact(&mut buffer).await
         .map_err(|e| ChainError::NetworkError(format!("Read failed: {}", e)))?;

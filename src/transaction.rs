@@ -7,6 +7,9 @@ use crate::error::ChainError;
 
 pub type Address = String;
 
+/// Maximum transaction size in bytes (100KB) to prevent DoS
+pub const MAX_TRANSACTION_SIZE: usize = 100_000;
+
 /// A transaction that can occur in a block
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Transaction {
@@ -20,13 +23,32 @@ impl Transaction {
         hex::encode(self.hash())
     }
 
-    /// Get the fee for this transaction
-    pub fn fee(&self) -> u64 {
-        match self {
-            Transaction::Subdivision(tx) => tx.fee,
-            Transaction::Transfer(tx) => tx.fee,
-            Transaction::Coinbase(_) => 0, // Coinbase has no fee
+    /// Validate transaction size to prevent DoS attacks
+    pub fn validate_size(&self) -> Result<(), ChainError> {
+        let serialized = bincode::serialize(self)
+            .map_err(|e| ChainError::InvalidTransaction(format!("Serialization failed: {}", e)))?;
+
+        if serialized.len() > MAX_TRANSACTION_SIZE {
+            return Err(ChainError::InvalidTransaction(
+                format!("Transaction too large: {} bytes (max: {})", serialized.len(), MAX_TRANSACTION_SIZE)
+            ));
         }
+        Ok(())
+    }
+
+    /// Get the geometric fee area for this transaction
+    pub fn fee_area(&self) -> crate::geometry::Coord {
+        match self {
+            Transaction::Subdivision(tx) => tx.fee as crate::geometry::Coord,
+            Transaction::Transfer(tx) => tx.fee_area,
+            Transaction::Coinbase(_) => 0.0, // Coinbase has no fee
+        }
+    }
+
+    /// Get the fee as u64 (for backward compatibility, converts fee_area)
+    /// Deprecated: Use fee_area() for geometric fees
+    pub fn fee(&self) -> u64 {
+        self.fee_area() as u64
     }
 
     /// Calculate the hash of this transaction
@@ -52,7 +74,7 @@ impl Transaction {
                 hasher.update(tx.input_hash);
                 hasher.update(tx.new_owner.as_bytes());
                 hasher.update(tx.sender.as_bytes());
-                hasher.update(tx.fee.to_le_bytes());
+                hasher.update(tx.fee_area.to_le_bytes());
                 hasher.update(tx.nonce.to_le_bytes());
             }
         };
@@ -218,12 +240,14 @@ impl CoinbaseTx {
 }
 
 /// Transfer transaction - moves ownership of a triangle
+/// Fee is now geometric: fee_area is deducted from the triangle's value
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransferTx {
     pub input_hash: Sha256Hash,
     pub new_owner: Address,
     pub sender: Address,
-    pub fee: u64,
+    /// Geometric fee: area deducted from triangle value and given to miner
+    pub fee_area: crate::geometry::Coord,
     pub nonce: u64,
     pub signature: Option<Vec<u8>>,
     pub public_key: Option<Vec<u8>>,
@@ -235,12 +259,15 @@ impl TransferTx {
     /// Maximum memo length (256 characters)
     pub const MAX_MEMO_LENGTH: usize = 256;
 
-    pub fn new(input_hash: Sha256Hash, new_owner: Address, sender: Address, fee: u64, nonce: u64) -> Self {
+    /// Geometric tolerance for fee comparisons (matches geometry.rs)
+    pub const GEOMETRIC_TOLERANCE: crate::geometry::Coord = 1e-9;
+
+    pub fn new(input_hash: Sha256Hash, new_owner: Address, sender: Address, fee_area: crate::geometry::Coord, nonce: u64) -> Self {
         TransferTx {
             input_hash,
             new_owner,
             sender,
-            fee,
+            fee_area,
             nonce,
             signature: None,
             public_key: None,
@@ -257,14 +284,15 @@ impl TransferTx {
         self.memo = Some(memo);
         Ok(self)
     }
-    
+
     pub fn signable_message(&self) -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice("TRANSFER:".as_bytes());
         message.extend_from_slice(&self.input_hash);
         message.extend_from_slice(self.new_owner.as_bytes());
         message.extend_from_slice(self.sender.as_bytes());
-        message.extend_from_slice(&self.fee.to_le_bytes());
+        // Use f64 bytes for geometric fee
+        message.extend_from_slice(&self.fee_area.to_le_bytes());
         message.extend_from_slice(&self.nonce.to_le_bytes());
         message
     }
@@ -274,6 +302,8 @@ impl TransferTx {
         self.public_key = Some(public_key);
     }
     
+    /// Stateless validation: checks signature, addresses, memo, and fee bounds.
+    /// Does NOT validate against UTXO state - use validate_with_state() for that.
     pub fn validate(&self) -> Result<(), ChainError> {
         if self.signature.is_none() || self.public_key.is_none() {
             return Err(ChainError::InvalidTransaction("Transfer not signed".to_string()));
@@ -283,9 +313,17 @@ impl TransferTx {
         if self.sender.is_empty() {
             return Err(ChainError::InvalidTransaction("Sender address cannot be empty".to_string()));
         }
-        
+
         if self.new_owner.is_empty() {
             return Err(ChainError::InvalidTransaction("New owner address cannot be empty".to_string()));
+        }
+
+        // Validate fee_area is non-negative and finite
+        if !self.fee_area.is_finite() {
+            return Err(ChainError::InvalidTransaction("Fee area must be a finite number".to_string()));
+        }
+        if self.fee_area < 0.0 {
+            return Err(ChainError::InvalidTransaction("Fee area cannot be negative".to_string()));
         }
 
         // Validate memo length to prevent DoS attacks
@@ -306,6 +344,43 @@ impl TransferTx {
 
         if !is_valid {
             return Err(ChainError::InvalidTransaction("Invalid signature".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Full validation including UTXO state check.
+    /// Ensures: input triangle exists AND input.effective_value() > fee_area + TOLERANCE
+    pub fn validate_with_state(&self, state: &TriangleState) -> Result<(), ChainError> {
+        // First perform stateless validation
+        self.validate()?;
+
+        // Check input triangle exists in UTXO set
+        let input_triangle = state.utxo_set.get(&self.input_hash).ok_or_else(|| {
+            ChainError::TriangleNotFound(format!(
+                "Transfer input {} not found in UTXO set",
+                hex::encode(self.input_hash)
+            ))
+        })?;
+
+        // Area balance check: input value must be strictly greater than fee
+        // Using tolerance to handle floating-point precision
+        let input_value = input_triangle.effective_value();
+        let remaining_value = input_value - self.fee_area;
+
+        if remaining_value < Self::GEOMETRIC_TOLERANCE {
+            return Err(ChainError::InvalidTransaction(format!(
+                "Insufficient triangle value: input has {:.9} but fee_area is {:.9}, leaving {:.9} (minimum: {:.9})",
+                input_value, self.fee_area, remaining_value, Self::GEOMETRIC_TOLERANCE
+            )));
+        }
+
+        // Verify sender owns the triangle
+        if input_triangle.owner != self.sender {
+            return Err(ChainError::InvalidTransaction(format!(
+                "Sender {} does not own input triangle (owned by {})",
+                self.sender, input_triangle.owner
+            )));
         }
 
         Ok(())
@@ -437,5 +512,165 @@ mod tests {
         let tx = SubdivisionTx::new(parent_hash, children.to_vec(), address, 0, 1);
 
         assert!(tx.validate(&state).is_err());
+    }
+
+    #[test]
+    fn test_geometric_fee_deduction() {
+        // Test case: Start with a large triangle (area ~10.0), transfer with fee_area 0.0001
+        // After transfer, the resulting triangle must have value = 10.0 - 0.0001
+
+        // Create a right triangle with area = 10.0 (base=4, height=5 -> area = 0.5*4*5 = 10)
+        let mut state = TriangleState::new();
+        let keypair = KeyPair::generate().unwrap();
+        let sender_address = keypair.address();
+
+        // Triangle with area exactly 10.0: vertices at (0,0), (4,0), (0,5)
+        // Area = 0.5 * base * height = 0.5 * 4 * 5 = 10.0
+        let large_triangle = Triangle::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 4.0, y: 0.0 },
+            Point { x: 0.0, y: 5.0 },
+            None,
+            sender_address.clone(),
+        );
+
+        let triangle_hash = large_triangle.hash();
+        let triangle_area = large_triangle.area();
+        assert!((triangle_area - 10.0).abs() < 1e-9, "Test setup: triangle should have area 10.0");
+
+        state.utxo_set.insert(triangle_hash, large_triangle);
+
+        // Create a transfer transaction with geometric fee
+        let fee_area: f64 = 0.0001;
+        let recipient_address = "recipient_address".to_string();
+
+        let mut tx = TransferTx::new(
+            triangle_hash,
+            recipient_address.clone(),
+            sender_address.clone(),
+            fee_area,
+            1,
+        );
+
+        // Sign the transaction
+        let message = tx.signable_message();
+        let signature = keypair.sign(&message).unwrap();
+        let public_key = keypair.public_key.serialize().to_vec();
+        tx.sign(signature, public_key);
+
+        // Validate the transaction against state
+        assert!(tx.validate_with_state(&state).is_ok(), "Transfer should be valid");
+
+        // Simulate what apply_block does:
+        // 1. Remove old triangle
+        let old_triangle = state.utxo_set.remove(&triangle_hash).unwrap();
+        let old_value = old_triangle.effective_value();
+        let new_value = old_value - fee_area;
+
+        // 2. Create new triangle with reduced value
+        let new_triangle = Triangle::new_with_value(
+            old_triangle.a,
+            old_triangle.b,
+            old_triangle.c,
+            old_triangle.parent_hash,
+            recipient_address.clone(),
+            new_value,
+        );
+
+        let new_hash = new_triangle.hash();
+        state.utxo_set.insert(new_hash, new_triangle);
+
+        // 3. Verify the result
+        let result_triangle = state.utxo_set.get(&new_hash).unwrap();
+
+        // Assert: new owner is the recipient
+        assert_eq!(result_triangle.owner, recipient_address);
+
+        // Assert: effective value is exactly 10.0 - 0.0001 = 9.9999
+        let expected_value = 10.0 - 0.0001;
+        let actual_value = result_triangle.effective_value();
+        assert!(
+            (actual_value - expected_value).abs() < 1e-12,
+            "After fee deduction, triangle value should be {:.9}, got {:.9}",
+            expected_value,
+            actual_value
+        );
+
+        // Assert: geometric area is unchanged (still 10.0)
+        let geometric_area = result_triangle.area();
+        assert!(
+            (geometric_area - 10.0).abs() < 1e-9,
+            "Geometric area should remain 10.0, got {:.9}",
+            geometric_area
+        );
+    }
+
+    #[test]
+    fn test_geometric_fee_insufficient_value() {
+        // Test that a fee larger than the triangle value fails validation
+        let mut state = TriangleState::new();
+        let keypair = KeyPair::generate().unwrap();
+        let sender_address = keypair.address();
+
+        // Small triangle with area ~0.5
+        let small_triangle = Triangle::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 0.0 },
+            Point { x: 0.5, y: 1.0 },
+            None,
+            sender_address.clone(),
+        );
+
+        let triangle_hash = small_triangle.hash();
+        let triangle_area = small_triangle.area();
+        state.utxo_set.insert(triangle_hash, small_triangle);
+
+        // Try to pay a fee larger than the triangle area
+        let fee_area = triangle_area + 0.1; // More than available
+
+        let mut tx = TransferTx::new(
+            triangle_hash,
+            "recipient".to_string(),
+            sender_address.clone(),
+            fee_area,
+            1,
+        );
+
+        let message = tx.signable_message();
+        let signature = keypair.sign(&message).unwrap();
+        let public_key = keypair.public_key.serialize().to_vec();
+        tx.sign(signature, public_key);
+
+        // This should fail validation due to insufficient value
+        let result = tx.validate_with_state(&state);
+        assert!(result.is_err(), "Transfer with fee > value should fail");
+
+        if let Err(ChainError::InvalidTransaction(msg)) = result {
+            assert!(msg.contains("Insufficient"), "Error should mention insufficient value");
+        } else {
+            panic!("Expected InvalidTransaction error");
+        }
+    }
+
+    #[test]
+    fn test_negative_fee_rejected() {
+        // Test that negative fees are rejected in stateless validation
+        let keypair = KeyPair::generate().unwrap();
+
+        let mut tx = TransferTx::new(
+            [0u8; 32],
+            "recipient".to_string(),
+            keypair.address(),
+            -1.0, // Negative fee
+            1,
+        );
+
+        let message = tx.signable_message();
+        let signature = keypair.sign(&message).unwrap();
+        let public_key = keypair.public_key.serialize().to_vec();
+        tx.sign(signature, public_key);
+
+        let result = tx.validate();
+        assert!(result.is_err(), "Negative fee should be rejected");
     }
 }

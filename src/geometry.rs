@@ -78,6 +78,8 @@ impl Point {
 // ----------------------------------------------------------------------------
 
 /// Represents a triangle defined by three points (vertices).
+/// The `value` field allows the effective value to be less than geometric area
+/// (e.g., after fee deduction). If None, value equals geometric area.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Triangle {
     pub a: Point,
@@ -85,12 +87,35 @@ pub struct Triangle {
     pub c: Point,
     pub parent_hash: Option<Sha256Hash>,
     pub owner: String,
+    /// Effective value of this triangle. If None, value = geometric area.
+    /// If Some(v), value = v (must be <= geometric area).
+    /// This enables fee deduction while preserving geometric identity.
+    #[serde(default)]
+    pub value: Option<Coord>,
 }
 
 impl Triangle {
     /// Creates a new Triangle from three vertices.
     pub fn new(a: Point, b: Point, c: Point, parent_hash: Option<Sha256Hash>, owner: String) -> Self {
-        Triangle { a, b, c, parent_hash, owner }
+        Triangle { a, b, c, parent_hash, owner, value: None }
+    }
+
+    /// Creates a new Triangle with an explicit value (for fee-reduced transfers).
+    pub fn new_with_value(
+        a: Point,
+        b: Point,
+        c: Point,
+        parent_hash: Option<Sha256Hash>,
+        owner: String,
+        value: Coord,
+    ) -> Self {
+        Triangle { a, b, c, parent_hash, owner, value: Some(value) }
+    }
+
+    /// Returns the effective value of this triangle.
+    /// If `value` is set, returns that; otherwise returns the geometric area.
+    pub fn effective_value(&self) -> Coord {
+        self.value.unwrap_or_else(|| self.area())
     }
 
     /// Calculates the center point (centroid) of the triangle.
@@ -147,6 +172,8 @@ impl Triangle {
 
     /// Subdivides the current triangle into three smaller, valid triangles.
     /// Optimized to minimize allocations and reuse computed values.
+    /// Note: Children inherit geometric area (value = None). If parent had
+    /// a reduced value, children's values are proportionally scaled.
     #[inline]
     pub fn subdivide(&self) -> [Triangle; 3] {
         // Compute midpoints inline to reduce function call overhead
@@ -165,14 +192,22 @@ impl Triangle {
 
         let parent_hash = Some(self.hash());
 
+        // If parent has a reduced value, scale children proportionally
+        // Each child gets 25% of parent's geometric area (75% total for 3 children)
+        // So each child's value = parent_value * 0.25 / 0.25 = parent_value / 3
+        let child_value = self.value.map(|v| v / 3.0);
+
         // Child 1 (A-mid_ab-mid_ca)
-        let t1 = Triangle::new(self.a, mid_ab, mid_ca, parent_hash, self.owner.clone());
+        let mut t1 = Triangle::new(self.a, mid_ab, mid_ca, parent_hash, self.owner.clone());
+        t1.value = child_value;
 
         // Child 2 (mid_ab-B-mid_bc)
-        let t2 = Triangle::new(mid_ab, self.b, mid_bc, parent_hash, self.owner.clone());
+        let mut t2 = Triangle::new(mid_ab, self.b, mid_bc, parent_hash, self.owner.clone());
+        t2.value = child_value;
 
         // Child 3 (mid_ca-mid_bc-C)
-        let t3 = Triangle::new(mid_ca, mid_bc, self.c, parent_hash, self.owner.clone());
+        let mut t3 = Triangle::new(mid_ca, mid_bc, self.c, parent_hash, self.owner.clone());
+        t3.value = child_value;
 
         [t1, t2, t3]
     }
